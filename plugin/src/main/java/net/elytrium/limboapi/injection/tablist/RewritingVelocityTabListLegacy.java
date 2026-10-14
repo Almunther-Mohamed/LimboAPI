@@ -35,12 +35,19 @@ public class RewritingVelocityTabListLegacy extends VelocityTabListLegacy implem
   protected final ProxyServer proxyServer;
   protected final Map<UUID, KeyedVelocityTabListEntry> entries;
 
+  // Velocity-CTD based forks have another constructor, RewritingTabListFactory should be used to create this tab list.
   public RewritingVelocityTabListLegacy(ConnectedPlayer player, ProxyServer proxyServer) {
     super(player, proxyServer);
     this.player = super.player;
     this.connection = super.connection;
     this.proxyServer = super.proxyServer;
     this.entries = super.entries;
+  }
+
+  // Velocity returns Player there, while its forks may return ConnectedPlayer, javac generates both methods for us.
+  @Override
+  public ConnectedPlayer getPlayer() {
+    return this.player;
   }
 
   @Override

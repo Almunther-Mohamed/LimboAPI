@@ -71,6 +71,7 @@ import java.util.Optional;
 import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.function.BiConsumer;
 import net.elytrium.commons.utils.reflection.ReflectionException;
 import net.elytrium.limboapi.LimboAPI;
@@ -213,7 +214,8 @@ public class LoginTasksQueue {
 
     Logger logger = LimboAPI.getLogger();
     String serverIdHash = (String) SERVER_ID_HASH_GETTER.invokeExact((AuthSessionHandler) this.handler);
-    this.server.getEventManager().fire(new LoginEvent(this.player, serverIdHash)).thenAcceptAsync(event -> {
+    LoginCompat.markLoginEventFired(this.player);
+    this.server.getEventManager().fire(new LoginEvent(this.player, serverIdHash)).thenComposeAsync(event -> {
       if (connection.isClosed()) {
         // The player was disconnected.
         this.server.getEventManager().fireAndForget(new DisconnectEvent(this.player, DisconnectEvent.LoginStatus.CANCELLED_BY_USER_BEFORE_COMPLETE));
@@ -222,21 +224,57 @@ public class LoginTasksQueue {
         if (reason.isPresent()) {
           this.player.disconnect0(reason.get(), false);
         } else {
-          if (this.server.registerConnection(this.player)) {
-            if (connection.getActiveSessionHandler() instanceof LoginConfirmHandler confirm) {
-              confirm.waitForConfirmation(() -> this.connectToServer(logger, this.player, connection));
-            } else {
-              this.connectToServer(logger, this.player, connection);
-            }
-          } else {
-            this.player.disconnect0(Component.translatable("velocity.error.already-connected-proxy"), false);
+          try {
+            // Velocity-CTD based forks register the connection asynchronously.
+            return LoginCompat.registerConnection(this.server, this.player)
+                .thenAcceptAsync(registered -> this.onConnectionRegistered(logger, connection, registered), this.inEventLoop(connection));
+          } catch (Throwable e) {
+            throw new ReflectionException(e);
           }
         }
       }
+
+      return CompletableFuture.completedFuture(null);
     }, connection.eventLoop()).exceptionally(t -> {
       logger.error("Exception while completing login initialisation phase for {}", this.player, t);
       return null;
     });
+  }
+
+  private void onConnectionRegistered(Logger logger, MinecraftConnection connection, boolean registered) {
+    if (!registered) {
+      if (!connection.isClosed()) {
+        this.player.disconnect0(Component.translatable("velocity.error.already-connected-proxy"), false);
+      }
+
+      return;
+    }
+
+    try {
+      if (connection.isClosed() || !LoginCompat.onPlayerConnected(this.server, this.player)) {
+        return;
+      }
+    } catch (Throwable e) {
+      throw new ReflectionException(e);
+    }
+
+    if (connection.getActiveSessionHandler() instanceof LoginConfirmHandler confirm) {
+      confirm.waitForConfirmation(() -> this.connectToServer(logger, this.player, connection));
+    } else {
+      this.connectToServer(logger, this.player, connection);
+    }
+  }
+
+  // Runs the task immediately if we are already in the event loop, so Velocity's synchronous registration behaves as before.
+  private Executor inEventLoop(MinecraftConnection connection) {
+    EventLoop eventLoop = connection.eventLoop();
+    return task -> {
+      if (eventLoop.inEventLoop()) {
+        task.run();
+      } else {
+        eventLoop.execute(task);
+      }
+    };
   }
 
   @SuppressFBWarnings("NP_NULL_ON_SOME_PATH_FROM_RETURN_VALUE")
@@ -279,7 +317,13 @@ public class LoginTasksQueue {
       this.plugin.setActiveSessionHandler(connection, StateRegistry.CONFIG, configHandler);
     }
 
-    this.server.getEventManager().fire(new PostLoginEvent(this.player)).thenAccept(postLoginEvent -> {
+    this.server.getEventManager().fire(new PostLoginEvent(this.player)).whenComplete((postLoginEvent, throwable) -> {
+      try {
+        LoginCompat.finalizeLogin(this.server, this.player);
+      } catch (Throwable e) {
+        logger.error("Exception while finalizing login of {}", this.player, e);
+      }
+    }).thenAccept(postLoginEvent -> {
       try {
         MC_CONNECTION_SETTER.accept(this.handler, connection);
         CONNECT_TO_INITIAL_SERVER_METHOD.invoke((AuthSessionHandler) this.handler, this.player);

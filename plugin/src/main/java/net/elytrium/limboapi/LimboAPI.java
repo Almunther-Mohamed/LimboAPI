@@ -43,6 +43,7 @@ import com.velocitypowered.proxy.protocol.netty.MinecraftCompressDecoder;
 import com.velocitypowered.proxy.protocol.netty.MinecraftCompressorAndLengthEncoder;
 import com.velocitypowered.proxy.protocol.netty.MinecraftDecoder;
 import com.velocitypowered.proxy.protocol.netty.MinecraftEncoder;
+import com.velocitypowered.proxy.protocol.netty.MinecraftVarintFrameDecoder;
 import com.velocitypowered.proxy.protocol.netty.MinecraftVarintLengthEncoder;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandler;
@@ -52,6 +53,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -116,6 +118,7 @@ import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.serializer.ComponentSerializer;
 import org.bstats.velocity.Metrics;
 import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
+import org.checkerframework.checker.nullness.qual.Nullable;
 import org.slf4j.Logger;
 
 @Plugin(
@@ -140,6 +143,9 @@ public class LimboAPI implements LimboFactory {
   public static final ConcurrentHashMap<Player, UUID> INITIAL_ID = new ConcurrentHashMap<>();
 
   private static final MethodHandle STATE_FIELD;
+  // MinecraftCompressDecoder#setState, exists only in some Velocity forks (e.g. VeloFlame).
+  @Nullable
+  private static final MethodHandle COMPRESS_DECODER_SET_STATE;
 
   private final VelocityServer server;
   private final Metrics.Factory metricsFactory;
@@ -481,13 +487,32 @@ public class LimboAPI implements LimboFactory {
 
   public void fixDecoderState(MinecraftConnection connection, StateRegistry state) {
     if (state.name() == null) { // custom state
-      MinecraftDecoder decoder = connection.getChannel().pipeline().get(MinecraftDecoder.class);
+      ChannelPipeline pipeline = connection.getChannel().pipeline();
+      MinecraftDecoder decoder = pipeline.get(MinecraftDecoder.class);
       if (decoder != null) {
         try {
           // Let decoder know what we're in PLAY state, or it will kick the player.
           STATE_FIELD.invokeExact(decoder, StateRegistry.PLAY);
         } catch (Throwable throwable) {
           LimboAPI.getLogger().error("Failed to fixup decoder", throwable);
+        }
+      }
+
+      // Some Velocity forks (e.g. VeloFlame) limit packets per state in these decoders, our custom state would be
+      // limited as the HANDSHAKE one there (as it has the same ordinal), so let them know what we're in PLAY state too.
+      MinecraftVarintFrameDecoder frameDecoder = pipeline.get(MinecraftVarintFrameDecoder.class);
+      if (frameDecoder != null) {
+        frameDecoder.setState(StateRegistry.PLAY);
+      }
+
+      if (COMPRESS_DECODER_SET_STATE != null) {
+        MinecraftCompressDecoder compressDecoder = pipeline.get(MinecraftCompressDecoder.class);
+        if (compressDecoder != null) {
+          try {
+            COMPRESS_DECODER_SET_STATE.invokeExact(compressDecoder, StateRegistry.PLAY);
+          } catch (Throwable throwable) {
+            LimboAPI.getLogger().error("Failed to fixup compression decoder", throwable);
+          }
         }
       }
     }
@@ -720,5 +745,15 @@ public class LimboAPI implements LimboFactory {
     } catch (NoSuchFieldException | IllegalAccessException e) {
       throw new RuntimeException(e);
     }
+
+    MethodHandle compressDecoderSetState;
+    try {
+      compressDecoderSetState = MethodHandles.publicLookup()
+          .findVirtual(MinecraftCompressDecoder.class, "setState", MethodType.methodType(void.class, StateRegistry.class));
+    } catch (NoSuchMethodException | IllegalAccessException e) {
+      compressDecoderSetState = null;
+    }
+
+    COMPRESS_DECODER_SET_STATE = compressDecoderSetState;
   }
 }
