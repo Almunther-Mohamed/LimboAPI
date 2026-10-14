@@ -48,7 +48,6 @@ import com.velocitypowered.api.util.UuidUtils;
 import com.velocitypowered.natives.compression.VelocityCompressor;
 import com.velocitypowered.natives.util.Natives;
 import com.velocitypowered.proxy.VelocityServer;
-import com.velocitypowered.proxy.config.PlayerInfoForwarding;
 import com.velocitypowered.proxy.config.VelocityConfiguration;
 import com.velocitypowered.proxy.connection.MinecraftConnection;
 import com.velocitypowered.proxy.connection.client.AuthSessionHandler;
@@ -83,9 +82,7 @@ import net.elytrium.limboapi.injection.dummy.ClosedMinecraftConnection;
 import net.elytrium.limboapi.injection.dummy.DummyEventPool;
 import net.elytrium.limboapi.injection.login.confirmation.LoginConfirmHandler;
 import net.elytrium.limboapi.injection.packet.ServerLoginSuccessHook;
-import net.elytrium.limboapi.injection.tablist.RewritingKeyedVelocityTabList;
-import net.elytrium.limboapi.injection.tablist.RewritingVelocityTabList;
-import net.elytrium.limboapi.injection.tablist.RewritingVelocityTabListLegacy;
+import net.elytrium.limboapi.injection.tablist.RewritingTabListFactory;
 import net.elytrium.limboapi.utils.LambdaUtil;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
@@ -179,13 +176,7 @@ public class LoginListener {
               playerKey
           );
 
-          if (connection.getProtocolVersion().noLessThan(ProtocolVersion.MINECRAFT_1_19_3)) {
-            TAB_LIST_SETTER.accept(player, new RewritingVelocityTabList(player));
-          } else if (connection.getProtocolVersion().noLessThan(ProtocolVersion.MINECRAFT_1_8)) {
-            TAB_LIST_SETTER.accept(player, new RewritingKeyedVelocityTabList(player, this.server));
-          } else {
-            TAB_LIST_SETTER.accept(player, new RewritingVelocityTabListLegacy(player, this.server));
-          }
+          TAB_LIST_SETTER.accept(player, RewritingTabListFactory.create(player, this.server));
 
           if (connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) >= 0) {
             loginHandler.setPlayer(player);
@@ -224,7 +215,7 @@ public class LoginListener {
 
               VelocityConfiguration configuration = this.server.getConfiguration();
               UUID playerUniqueID = player.getUniqueId();
-              if (configuration.getPlayerInfoForwardingMode() == PlayerInfoForwarding.NONE) {
+              if (LoginCompat.isPlayerInfoForwardingDisabled(configuration)) {
                 playerUniqueID = UuidUtils.generateOfflinePlayerUuid(player.getUsername());
               }
 

@@ -59,6 +59,12 @@ public class RewritingVelocityTabList extends VelocityTabList implements Rewriti
     }
   }
 
+  // Velocity returns Player there, while its forks may return ConnectedPlayer, javac generates both methods for us.
+  @Override
+  public ConnectedPlayer getPlayer() {
+    return this.player;
+  }
+
   @Override
   public void addEntry(TabListEntry entry) {
     super.addEntry(this.rewriteEntry(entry));

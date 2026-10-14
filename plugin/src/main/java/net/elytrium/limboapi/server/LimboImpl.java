@@ -442,6 +442,8 @@ public class LimboImpl implements Limbo {
     }
 
     connection.setActiveSessionHandler(connection.getState(), sessionHandler);
+    // The player may be already in a limbo, the decoders should be fixed up again after the state update.
+    this.plugin.fixDecoderState(connection, connection.getState());
     if (connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) >= 0) {
       if (connection.getState() != StateRegistry.CONFIG) {
         if (this.shouldRejoin) {
