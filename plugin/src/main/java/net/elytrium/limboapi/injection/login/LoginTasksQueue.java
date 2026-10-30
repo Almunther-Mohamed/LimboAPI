@@ -225,9 +225,15 @@ public class LoginTasksQueue {
           this.player.disconnect0(reason.get(), false);
         } else {
           try {
-            // Velocity-CTD based forks register the connection asynchronously.
+            // Velocity-CTD based forks register the connection and the player in the cluster asynchronously.
+            Executor executor = this.inEventLoop(connection);
             return LoginCompat.registerConnection(this.server, this.player)
-                .thenAcceptAsync(registered -> this.onConnectionRegistered(logger, connection, registered), this.inEventLoop(connection));
+                .thenComposeAsync(registered -> this.onConnectionRegistered(connection, registered), executor)
+                .thenAcceptAsync(connected -> {
+                  if (connected) {
+                    this.onPlayerConnected(logger, connection);
+                  }
+                }, executor);
           } catch (Throwable e) {
             throw new ReflectionException(e);
           }
@@ -241,19 +247,35 @@ public class LoginTasksQueue {
     });
   }
 
-  private void onConnectionRegistered(Logger logger, MinecraftConnection connection, boolean registered) {
+  private CompletableFuture<Boolean> onConnectionRegistered(MinecraftConnection connection, boolean registered) {
     if (!registered) {
       if (!connection.isClosed()) {
         this.player.disconnect0(Component.translatable("velocity.error.already-connected-proxy"), false);
       }
 
-      return;
+      return CompletableFuture.completedFuture(false);
+    }
+
+    if (connection.isClosed()) {
+      return CompletableFuture.completedFuture(false);
     }
 
     try {
-      if (connection.isClosed() || !LoginCompat.onPlayerConnected(this.server, this.player)) {
+      return LoginCompat.onPlayerConnect(this.server, this.player);
+    } catch (Throwable e) {
+      throw new ReflectionException(e);
+    }
+  }
+
+  private void onPlayerConnected(Logger logger, MinecraftConnection connection) {
+    try {
+      if (connection.isClosed()) {
+        // The teardown doesn't unregister the player from the cluster as the player isn't fully connected yet.
+        LoginCompat.onPlayerLoginAborted(this.server, this.player);
         return;
       }
+
+      LoginCompat.fullyConnected(this.player);
     } catch (Throwable e) {
       throw new ReflectionException(e);
     }

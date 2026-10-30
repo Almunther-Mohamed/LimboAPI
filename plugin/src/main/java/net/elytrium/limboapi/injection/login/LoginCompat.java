@@ -17,6 +17,7 @@
 
 package net.elytrium.limboapi.injection.login;
 
+import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.proxy.VelocityServer;
 import com.velocitypowered.proxy.config.VelocityConfiguration;
 import com.velocitypowered.proxy.connection.client.ConnectedPlayer;
@@ -24,6 +25,8 @@ import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.lang.reflect.Method;
+import java.net.InetAddress;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import net.elytrium.commons.utils.reflection.ReflectionException;
 import org.checkerframework.checker.nullness.qual.Nullable;
@@ -46,13 +49,26 @@ public final class LoginCompat {
   @Nullable
   private static final MethodHandle REGISTER_CONNECTION_ASYNC;
 
+  // Newer Velocity-CTD versions have removed it, as the player is checked during the registration there.
+  @Nullable
+  private static final MethodHandle CAN_REGISTER_CONNECTION;
+  @Nullable
+  private static final MethodHandle IS_KICK_EXISTING_PLAYERS;
+  @Nullable
+  private static final MethodHandle IS_KICK_EXISTING_PLAYERS_CHECK_IP;
+
   // Velocity-CTD based forks only, all of these are absent on Velocity.
   // DisconnectEvent is fired on these forks only if the player is marked as the one who has received LoginEvent.
   @Nullable
   private static final MethodHandle MARK_LOGIN_EVENT_FIRED;
-  // Registers the player in the cluster (e.g. in redis) and in the queue manager.
+  // Registers the player in the cluster (e.g. in redis), newer versions do it asynchronously.
   @Nullable
   private static final MethodHandle CLUSTER_ON_PLAYER_CONNECT;
+  @Nullable
+  private static final MethodHandle CLUSTER_ON_PLAYER_CONNECT_ASYNC;
+  @Nullable
+  private static final MethodHandle CLUSTER_ON_PLAYER_LOGIN_ABORTED;
+  // Registers the player in the queue manager, the cluster unregisters only fully connected players.
   @Nullable
   private static final MethodHandle FULLY_CONNECTED;
   // Releases the identity lock acquired during the registration, otherwise the player gets kicked after some time.
@@ -66,6 +82,35 @@ public final class LoginCompat {
   public static boolean isPlayerInfoForwardingDisabled(VelocityConfiguration configuration) throws Throwable {
     Enum<?> mode = (Enum<?>) GET_PLAYER_INFO_FORWARDING_MODE.invokeExact(configuration);
     return mode.name().equals("NONE");
+  }
+
+  /**
+   * Checks whether the player can be registered, it's done before the login to not let duplicated players into a limbo.
+   */
+  public static boolean canRegisterConnection(VelocityServer server, ConnectedPlayer player) throws Throwable {
+    if (CAN_REGISTER_CONNECTION != null) {
+      return (boolean) CAN_REGISTER_CONNECTION.invokeExact(server, player);
+    }
+
+    // The same rules the registration uses on Velocity-CTD based forks.
+    Optional<Player> existingByUuid = server.getPlayer(player.getUniqueId());
+    Optional<Player> existingByName = server.getPlayer(player.getUsername());
+    if (existingByUuid.isEmpty() && existingByName.isEmpty()) {
+      return true;
+    }
+
+    VelocityConfiguration configuration = server.getConfiguration();
+    if (IS_KICK_EXISTING_PLAYERS == null || !(boolean) IS_KICK_EXISTING_PLAYERS.invokeExact(configuration)) {
+      return false;
+    }
+
+    if (IS_KICK_EXISTING_PLAYERS_CHECK_IP == null || !(boolean) IS_KICK_EXISTING_PLAYERS_CHECK_IP.invokeExact(configuration)) {
+      return true;
+    }
+
+    InetAddress address = player.getRemoteAddress().getAddress();
+    return existingByUuid.map(existing -> address.equals(existing.getRemoteAddress().getAddress())).orElse(true)
+        && existingByName.map(existing -> address.equals(existing.getRemoteAddress().getAddress())).orElse(true);
   }
 
   @SuppressWarnings("unchecked")
@@ -86,18 +131,35 @@ public final class LoginCompat {
   /**
    * Should be called once the player has been registered and the login can't be denied by LoginEvent anymore.
    *
-   * @return false if the proxy has rejected the login (e.g. the player is already online on another proxy of the cluster)
+   * @return a future completing with false if the proxy has rejected the login
+   *     (e.g. the player is already online on another proxy of the cluster)
    */
-  public static boolean onPlayerConnected(VelocityServer server, ConnectedPlayer player) throws Throwable {
-    if (CLUSTER_ON_PLAYER_CONNECT != null && !(boolean) CLUSTER_ON_PLAYER_CONNECT.invokeExact(server, player)) {
-      return false;
+  @SuppressWarnings("unchecked")
+  public static CompletableFuture<Boolean> onPlayerConnect(VelocityServer server, ConnectedPlayer player) throws Throwable {
+    if (CLUSTER_ON_PLAYER_CONNECT_ASYNC != null) {
+      return (CompletableFuture<Boolean>) CLUSTER_ON_PLAYER_CONNECT_ASYNC.invokeExact(server, player);
     }
 
+    if (CLUSTER_ON_PLAYER_CONNECT != null) {
+      return CompletableFuture.completedFuture((boolean) CLUSTER_ON_PLAYER_CONNECT.invokeExact(server, player));
+    }
+
+    return CompletableFuture.completedFuture(true);
+  }
+
+  /**
+   * Should be called instead of {@link #fullyConnected} if the connection was closed during {@link #onPlayerConnect}.
+   */
+  public static void onPlayerLoginAborted(VelocityServer server, ConnectedPlayer player) throws Throwable {
+    if (CLUSTER_ON_PLAYER_LOGIN_ABORTED != null) {
+      CLUSTER_ON_PLAYER_LOGIN_ABORTED.invokeExact(server, player);
+    }
+  }
+
+  public static void fullyConnected(ConnectedPlayer player) throws Throwable {
     if (FULLY_CONNECTED != null) {
       FULLY_CONNECTED.invokeExact(player);
     }
-
-    return true;
   }
 
   /**
@@ -124,6 +186,12 @@ public final class LoginCompat {
 
   private static MethodHandle unreflect(Method method) throws IllegalAccessException {
     return MethodHandles.privateLookupIn(method.getDeclaringClass(), MethodHandles.lookup()).unreflect(method);
+  }
+
+  @Nullable
+  private static MethodHandle findOptional(Class<?> clazz, String name, MethodType type) throws IllegalAccessException {
+    Method method = findMethod(clazz, name, type.dropParameterTypes(0, 1).parameterArray());
+    return method == null || method.getReturnType() != type.returnType() ? null : unreflect(method).asType(type);
   }
 
   // Creates (VelocityServer, ConnectedPlayer)<return type> handle, that calls server.<getter>().<method>(player).
@@ -165,13 +233,19 @@ public final class LoginCompat {
         throw new NoSuchMethodException("Unsupported VelocityServer#registerConnection return type: " + registerConnection.getReturnType());
       }
 
-      Method markLoginEventFired = findMethod(ConnectedPlayer.class, "markLoginEventFired");
-      MARK_LOGIN_EVENT_FIRED = markLoginEventFired == null ? null : unreflect(markLoginEventFired);
+      CAN_REGISTER_CONNECTION = findOptional(VelocityServer.class, "canRegisterConnection",
+          MethodType.methodType(boolean.class, VelocityServer.class, ConnectedPlayer.class));
+      IS_KICK_EXISTING_PLAYERS = findOptional(VelocityConfiguration.class, "isKickExistingPlayers",
+          MethodType.methodType(boolean.class, VelocityConfiguration.class));
+      IS_KICK_EXISTING_PLAYERS_CHECK_IP = findOptional(VelocityConfiguration.class, "isKickExistingPlayersCheckIp",
+          MethodType.methodType(boolean.class, VelocityConfiguration.class));
 
-      Method fullyConnected = findMethod(ConnectedPlayer.class, "fullyConnected");
-      FULLY_CONNECTED = fullyConnected == null ? null : unreflect(fullyConnected);
+      MARK_LOGIN_EVENT_FIRED = findOptional(ConnectedPlayer.class, "markLoginEventFired", MethodType.methodType(void.class, ConnectedPlayer.class));
+      FULLY_CONNECTED = findOptional(ConnectedPlayer.class, "fullyConnected", MethodType.methodType(void.class, ConnectedPlayer.class));
 
       CLUSTER_ON_PLAYER_CONNECT = findServiceMethod("getClusterPlayerService", "onPlayerConnect", boolean.class);
+      CLUSTER_ON_PLAYER_CONNECT_ASYNC = findServiceMethod("getClusterPlayerService", "onPlayerConnectAsync", CompletableFuture.class);
+      CLUSTER_ON_PLAYER_LOGIN_ABORTED = findServiceMethod("getClusterPlayerService", "onPlayerLoginAborted", void.class);
       FINALIZE_LOGIN = findServiceMethod("getPlayerRegistry", "finalizeLogin", void.class);
     } catch (NoSuchMethodException | IllegalAccessException e) {
       throw new ReflectionException(e);
